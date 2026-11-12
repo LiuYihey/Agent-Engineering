@@ -1,0 +1,96 @@
+---
+description: 设计 agent 工具时把模型当控制面而不是数据面——批量数据走文件与句柄，不穿过 token
+alwaysApply: true
+---
+
+# 工具设计指南：模型是控制面，不是数据面
+
+## 一条总原则
+
+模型负责**计划、选择、判断**（control plane）；字节负责在系统之间流动（data plane）。
+工具设计中唯一不能破坏的边界：**批量数据不得以 token 形式穿过模型**。
+
+判断一个工具是否合格，只问一句：
+
+> 这份数据的字符，是模型生成的，还是文件/数据库生成的？
+
+只要答案是"模型生成的"，就存在成本翻倍、内容失真、上下文丢失三个隐患。
+
+## 为什么内联批量数据一定出问题
+
+内联（inline）= 数据本体写在 tool call 参数或返回文本里；引用（reference）= 只传 `path` / `id` / `uri`。
+
+| 失效模式 | 机制 |
+|---|---|
+| 成本与延迟 | 同一份数据付两次费（输入一次、输出一次），且必须串行生成完 |
+| 保真度 | 模型输出是**概率采样**，不是内存拷贝；几百行数字必然串行、错位、凭印象补数 |
+| 易失性 | 数据只活在上下文里，被 prune / compaction 裁掉后模型只剩"记忆"，开始编造 |
+| 规模上限 | 输出受 `max_tokens` 约束，超出就截断或空回合 |
+
+**本仓库实测**（session `d1c7fd14-1f2`，612 条 CD8 设计打分）：
+
+- 129 次工具调用：`score_sequence` 38 次（796 条序列）、`run_analysis_code` 76 次
+- 其中 33/76 的分析调用是**纯搬运**：7 次把 776 行分数敲进代码、26 次合并与长度校验返工
+- 同一个会话出现过连续 3 轮 `text_len=0, stop_reason=max_tokens` 的空回合
+- 这不是模型"不听话"，而是它没有"复制"操作——只有重新生成
+
+## 决策表
+
+| 场景 | 正确做法 |
+|---|---|
+| 输入可能是批量数据（序列、行、表） | 支持 `input_path`（CSV/TSV/JSON/FASTA），内联参数保留但降级为便捷通道 |
+| 输出可能超过约 2 KB 或 50 行 | 支持 `output_path`，返回摘要 + 路径；缺失时保持原行为 |
+| 输出是用来**推理**的（单任务配置、指标、记忆条目） | 保持内联。读工具不要 handle 化 |
+| 数据已经在磁盘上（`data/`、`results/`、`artifacts/`） | 不要新增工具，让 agent 用 `run_analysis_code` 直接读写 |
+| 需要用户看到/下载 | 写 `artifacts/` 下，由 sandbox 自动注册 artifact |
+
+阈值不是教条：`get_task_info` 返回一个任务的完整 launch config 与质量档位是正确的——模型必须看全才能判断。**读全 ≠ 搬全**。
+
+## 五条行业标准模式
+
+1. **Handle over value**：返回引用而不是值。代表：OpenAI Code Interpreter 的沙箱文件名、Anthropic Files API 的 `file_id`、MCP resources 的 URI、ADK artifacts。
+2. **Push compute to data**：让模型写查询/程序，数据不动。代表：Text-to-SQL（BigQuery、Databricks Genie）、Code Interpreter。本项目对应 `query_table` + `run_analysis_code`。
+3. **Preview + handle**：返回 schema、行数、头几行与路径，绝不返回全表。对应 `df.head()` / `df.describe()` / SQL `LIMIT` + `COUNT`。
+4. **双通道输出**：机器通道落盘，模型通道只拿摘要。`score_sequence` 的 `output_path` 就是这个形态。
+5. **类型化契约 + 幂等**：边界用 JSON Schema / Pydantic 校验一次；结果按 `run_id` 可重复读取，不必重算。
+
+## 新增工具的验收清单
+
+- [ ] 批量输入可以走 `input_path`，不必让模型念数据
+- [ ] 大输出可以走 `output_path`，且**不传时行为完全不变**
+- [ ] 返回文本包含：做了什么、多少行、写到哪、怎么读回来
+- [ ] 截断必须显式说明（`truncated` + 分页/收窄建议），禁止静默截断
+- [ ] 写 `artifacts/` 的产物会自动成为聊天里的可下载 artifact
+- [ ] 描述里写明 "read it back with run_analysis_code, do not retype"
+- [ ] 新增参数同步更新 yaml 描述、CORE.md、wiki、测试
+
+## 容易踩的坑
+
+1. **按"单块大小"做裁剪，挡不住"块数多 + 单块中等"**。100 条 3.5K 字符的 tool_result 全部低于 4K 阈值，一条都裁不到。要按**块类型**裁（tool_result / tool_use input / thinking），不能只看长度。
+2. **假设模型会"复制"工具输出**。它没有剪贴板；写文件就是把数据重新生成一遍。
+3. **让数据只存在于对话**。一旦 prune / compaction 生效，源数据消失，模型从"抄"变成"编"，且校验永远过不了。
+4. **手抄 → 校验 → 重抄 是死循环**，不会自己收敛。看到模型承认"我记错了""必须重建"，就该停掉并改数据结构。
+5. **thinking 吃光输出预算**。adaptive thinking + 长任务会返回 0 文本 0 tool_call 的 `max_tokens` 空回合，UI 表现为"agent 死了"。要有空回合重试与兜底提示。
+6. **只给 handle 不给摘要**。模型拿到路径却不知道下一步做什么；摘要要包含行数、列名、读取方式。
+7. **把读工具也 handle 化**。模型看不到细节就无法推理，属于过度设计。
+8. **静默截断**。`limit` 命中上限却不告知，模型会以为数据完整并给出错误结论。
+9. **写了文件没注册 artifact**。用户看不到交付物；`write_file` / `output_path` 写 `artifacts/` 才可见。
+10. **只改 executor 不改描述/CORE**。模型不会用新参数，等于没改。
+11. **只靠 prompt 说"不要重打"**。文字约束是软性的；结构上让它**没有素材可抄**才可靠（默认文件进、文件出）。
+12. **把大数组塞进 tool 参数**。超过 `max_tokens` 会截断或直接失败，且失败信息往往不可见。
+
+## 本项目参考实现
+
+- `ProteinHarness/executors/sequence_score.py`：`input_path` / `output_path`，支持 CSV/TSV/JSON/FASTA，CSV 全字段不截断
+- `ProteinHarness/executors/meta_query.py`：可选 `output_path` 导出 CSV，命中行数上限时提示 `LIMIT/OFFSET`
+- `ProteinHarness/executors/sandbox_tools.py`：`run_analysis_code` 是数据面计算入口
+- `ProteinHarness/agents/design/CORE.md`：第 6 条硬规则，禁止把工具输出重打进代码
+- `ProteinHarness/context_compaction.py`：按块类型裁剪 + 摘要压缩
+
+## Review 时直接拒绝的写法
+
+- 工具唯一输入是"一个大数组"，且没有 `input_path`
+- 工具返回整张表，却没有 `output_path` 或 handle
+- "导出"工具把文件内容作为文本返回，而不是返回路径
+- 有行数上限但没有 `truncated` 标记
+- 为了让模型"看到数据"而把几百行样例复制进 prompt 或 yaml 描述
