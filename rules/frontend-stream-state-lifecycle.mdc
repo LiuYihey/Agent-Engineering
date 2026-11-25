@@ -24,12 +24,20 @@ alwaysApply: false
    未知/缺失状态按终态渲染，禁止 fallback 成 `running`。
 5. **计数/计时不得随组件重挂载重置**：一段过程的开始时间必须由流程状态持有（如
    channel/store），等待态与流式态共用同一个起点；禁止用组件 `mountRef` 作为计时起点。
-6. **验收标准**：在任意时刻停止生成，UI 在一帧内不再出现 `running` 或闪烁动效；
-   刷新页面、切走再切回同一会话，状态一致且没有残留的进行中指示。
+6. **持久化不是终态来源**：落盘/缓存的 `running` 只代表"某个进程曾打开过"，不代表"现在还在跑"。
+   任何从存储恢复的入口（页面加载、会话切换、后台轮询 merge）都必须把 `running` 收敛为终态，
+   否则一次丢失的 close 事件会让卡片永远转下去；反向覆盖同样禁止——已收敛的终态不得被
+   旧快照重新写回 `running`。
+7. **验收标准**：在任意时刻停止生成，UI 在一帧内不再出现 `running` 或闪烁动效；
+   刷新页面、切走再切回同一会话、等待一次后台轮询之后，状态都一致且没有残留的进行中指示。
 
 ## 参考实现
 
 - `Interface/src/lib/designAgentStream.js` → `finalizeInterrupted()`：把所有 `running`
   工具卡置为 `cancelled`、把 `_streaming` 的推理行收尾，由两个聊天流的 `finally` 调用。
+- `Interface/src/lib/streamMessages.js` → `settleStaleToolcards()`：所有存储快照入口
+  （本地缓存、会话加载、后台轮询 merge）统一调用，防止死掉流的 `running` 被反复读回。
+- `Backend/main.py` → `_settle_stale_toolcards()`：服务端在返回会话前把过期 `running`
+  落盘为 `cancelled`（`in_progress` 为真时跳过），让存储本身不再携带假状态。
 - `Interface/src/components/AgentChat.jsx` → `runStreamTeardown(...)` 内统一收尾。
 - 禁用 `setTimeout` 猜测收尾；超时 watchdog 最多触发 abort，收尾仍走同一个 settle 路径。
