@@ -1,0 +1,35 @@
+---
+description: 前端流式/异步 UI 状态必须在成功、失败、中止、断连、超时等所有终态收敛，禁止残留 running/动效
+globs: Interface/src/**
+alwaysApply: false
+---
+
+# 流式 UI 状态必须可收敛（前端工程实践）
+
+## 事故背景
+
+工具卡片显示 `running` 时用户停止了生成。SSE 连接被 abort 后，前端只收到部分事件，
+`toolcard_close` 永不到达，卡片从此停留在绿色 `running` 动效上。实际上工具请求已随
+中断结束，UI 却仍在宣称“正在执行”——这是状态机缺少终态，而不是样式问题。
+
+## 规则
+
+1. **每个“进行中”状态都必须有完整终态集合**：`running` 必须有 `done` / `error` /
+   `cancelled` 三种出口。任何 `streaming`、`loading`、`typing`、计时中、旋转动效同理。
+2. **终态收敛只允许有一个入口**：放在流生命周期的 `finally` / `settle()` 中统一执行，
+   不得依赖某个特定事件（如 `toolcard_close`）到达。新增事件类型时，不得新增未收敛路径。
+3. **中断即终态**：`AbortController.abort()`、SSE 断开、超时、切换会话、组件卸载时，
+   必须同时停止：动效、计时器、轮询、订阅；并把所有 `running` 项标记为 `cancelled`。
+4. **渲染层不得用默认值推断存活**：`status` 取值限定为 `running | done | error | cancelled`；
+   未知/缺失状态按终态渲染，禁止 fallback 成 `running`。
+5. **计数/计时不得随组件重挂载重置**：一段过程的开始时间必须由流程状态持有（如
+   channel/store），等待态与流式态共用同一个起点；禁止用组件 `mountRef` 作为计时起点。
+6. **验收标准**：在任意时刻停止生成，UI 在一帧内不再出现 `running` 或闪烁动效；
+   刷新页面、切走再切回同一会话，状态一致且没有残留的进行中指示。
+
+## 参考实现
+
+- `Interface/src/lib/designAgentStream.js` → `finalizeInterrupted()`：把所有 `running`
+  工具卡置为 `cancelled`、把 `_streaming` 的推理行收尾，由两个聊天流的 `finally` 调用。
+- `Interface/src/components/AgentChat.jsx` → `runStreamTeardown(...)` 内统一收尾。
+- 禁用 `setTimeout` 猜测收尾；超时 watchdog 最多触发 abort，收尾仍走同一个 settle 路径。
